@@ -1,0 +1,594 @@
+from __future__ import print_function
+import time
+import pickle
+import re
+import os
+import csv
+import numpy as np
+import pandas as pd
+import json
+import scipy.sparse
+import itertools
+import matplotlib.pyplot as plt
+import pylab as pl
+import spacy
+nlp = spacy.load('en')
+
+from imblearn.over_sampling import ADASYN, RandomOverSampler
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.combine import SMOTEENN, SMOTETomek
+
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.feature_extraction import DictVectorizer
+
+dictvect = DictVectorizer()
+
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectFromModel
+from sklearn.feature_selection import SelectKBest, chi2, mutual_info_regression, f_classif
+
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import RidgeClassifier
+from sklearn.linear_model import SGDClassifier, LogisticRegression, LinearRegression
+from sklearn.linear_model import Perceptron
+from sklearn.linear_model import PassiveAggressiveClassifier
+from sklearn.naive_bayes import BernoulliNB, MultinomialNB, GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neighbors import NearestCentroid
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+
+from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
+from sklearn.model_selection import cross_val_score, GridSearchCV, train_test_split, StratifiedKFold
+from sklearn.utils import shuffle
+
+import warnings
+warnings.filterwarnings("ignore")
+
+def preprocess(text):
+    """
+    Preprocess textfile by removing metadata and newlines.
+    :param file: input text document of speech or debate
+    :return: preprocessed text of input file
+    """
+    text = re.sub('<.*>','', text)
+    text = re.sub('\[.*\]','', text)
+    text = re.sub('\(.*\)','', text)
+    text = re.sub('\s',' ', text)
+    text = re.sub('\"', '', text)
+    return text
+
+def find_era(year):
+    if year >=1933 and year<1945:
+        era = 1 #'FDR'
+    elif year >=1945 and year<1953:
+        era= 2 # 'Truman'
+    elif year >=1953 and year<1961:
+        era= 3 #'Eisenhower'
+    elif year >=1961 and year<1964:
+        era= 4# 'JFK'
+    elif year >=1964 and year<1969:
+        era= 5 #'LBJ'
+    elif year >=1969 and year<1974:
+        era= 6 #'Nixon'
+    elif year >=1974 and year<1977:
+        era= 7 #'Ford'
+    elif year >=1977 and year<1981:
+        era= 8 #'Carter'
+    elif year >=1981 and year<1989:
+        era= 9 #'Reagan'
+    elif year >=1989 and year<1993:
+        era= 10 #'Bush Sr.'
+    elif year >=1993 and year<2001:
+        era= 11 #'Clinton'
+    elif year >=2001 and year<2009:
+        era= 12 #'Bush Jr.'
+    elif year >=2009 and year<2017:
+        era= 13 #'Obama'
+    elif year >=2017 and year<2019:
+        era= 14 #'Trump'
+    else:
+        era= 0 #'unkn'
+
+    return era
+
+def read_csv(csvfilename):
+    data = []
+    with open(csvfilename) as csvfile:
+        readCSV = csv.reader(csvfile, delimiter=',')
+        next(readCSV)
+        for row in readCSV:
+            text = row[3]
+            date = row[1]
+            year = int((''.join([i for i in date if i.isdigit()]))[-2:])
+            if year > 40:
+                year = year+1900
+            else:
+                year = year+2000
+            if year<1933 or year>2018:
+                print('Error: Year not in document or incorrect in file')
+                era = 0 #'unkn'
+            else:
+                era = find_era(year)
+            if row[0] == 'rep':
+                data.append([0,era,text])
+            elif row[0] == 'dem':
+                data.append([1,era,text])
+
+    return data
+
+
+def read_corpus(corpus_path):
+    """
+    Reads text files of speeches that are organized in folders by speaker. Each folder represents a speaker and must
+    start with r/d, corresponding to Republican/Democrat
+    :param corpus_path: Filepath to folder containing all subfolders
+    :return: data as nested list with [label, text]
+    """
+    data = []
+    for foldername in os.listdir(corpus_path):
+        for filename in os.listdir(corpus_path+'/'+foldername):
+            file = open(corpus_path+'/'+foldername+'/'+filename, 'r')
+            text = file.read()
+            file.close()
+
+            year = re.findall('[1-2][0-9]{3}', filename)
+            if not year:
+                year = re.findall('[1-2][0-9]{3}', text)
+
+            if not year:
+                print('Error: Year not in document or incorrect in file: ', filename)
+                era = 'unkn'
+            else:
+                era = find_era(int(year[0]))
+            text = preprocess(text)
+            if str(foldername).startswith('r'):
+                data.append([0, era, text])
+            elif str(foldername).startswith('d'):
+                data.append([1, era, text])
+
+    return data
+
+
+def filter_text(text, query_list):
+
+    doc = nlp(text)
+    newtext = ''
+    for query_search in query_list:
+        query = nlp(query_search)
+        if len(query) == 1:
+            for sent in doc.sents:
+                for i in range(len(sent)):
+                    if sent[i].lemma_ == query[0].lemma_:
+                        for j in range(len(sent)):
+                            newtext+= sent[j].text +' '
+                        newtext+= '.'
+
+        elif len(query) == 2:
+            for sent in doc.sents:
+                for j in range(len(query)-1):
+                    for i in range(len(sent)):
+                        if sent[i].lemma_ == query[j].lemma_:
+                            if str(sent[i].nbor()) == query[j+1].text:
+                                for k in range(len(sent)):
+                                    newtext+= sent[k].text +' '
+                                newtext+= '.'
+        else:
+            print('Error: Query with more than 2 words!')
+
+    return newtext
+
+
+globwarm_rep_file = open('globwarm_rep_file','r')
+glo_r = nlp(globwarm_rep_file.read())
+gun_rep_file = open('gun_rep_file','r')
+gun_r = nlp(gun_rep_file.read())
+health_rep_file = open('health_rep_file','r')
+hea_r = nlp(health_rep_file.read())
+immigr_rep_file = open('immigr_rep_file','r')
+imm_r = nlp(immigr_rep_file.read())
+tax_rep_file = open('tax_rep_file','r')
+tax_r = nlp(tax_rep_file.read())
+
+globwarm_dem_file = open('globwarm_dem_file','r')
+glo_d = nlp(globwarm_dem_file.read())
+gun_dem_file = open('gun_dem_file','r')
+gun_d = nlp(gun_dem_file.read())
+health_dem_file = open('health_dem_file','r')
+hea_d = nlp(health_dem_file.read())
+immigr_dem_file = open('immigr_dem_file','r')
+imm_d = nlp(immigr_dem_file.read())
+tax_dem_file = open('tax_dem_file','r')
+tax_d = nlp(tax_dem_file.read())
+
+
+def process(data):
+    """
+    Extract features from list of labelled text data
+    :param data: list of labelled text data -> read_corpus
+    :return: pandas dataframe feature matrix X, and labels list y
+    """
+    labels = []
+    years = []
+    text_list = []
+    lem_list = []
+    vec_list = []
+    pos_list = []
+
+    rep_glo = []
+    rep_gun = []
+    rep_hea = []
+    rep_imm = []
+    rep_tax = []
+
+    dem_glo = []
+    dem_gun = []
+    dem_hea = []
+    dem_imm = []
+    dem_tax = []
+
+    for i in range(len(data)):
+        if i == int(len(data)/4):
+            print('25%', time.asctime( time.localtime(time.time())))
+        if i == int(len(data)/2):
+            print('50%', time.asctime( time.localtime(time.time())))
+        if i == int(3*len(data)/4):
+            print('75%', time.asctime( time.localtime(time.time())))
+        labels.append(data[i][0])
+        years.append(data[i][1])
+
+        lem = ' '
+        pos = ' '
+        glo = ' '
+        gun = ' '
+        hea = ' '
+        imm = ' '
+        tax = ' '
+        text = data[i][2]
+        doc = nlp(text)
+
+        for sent in doc.sents:
+            for j in range(len(sent)):
+                lem += sent[j].lemma_ + ' '
+                pos += sent[j].pos_ + ' '
+                if sent[j].lemma_ == 'global' and str(sent[j].nbor()) == 'warming':
+                    for j in range(len(sent)):
+                        glo += sent[j].text +' '
+                if sent[j].lemma_ == 'gun':
+                    for j in range(len(sent)):
+                        gun += sent[j].text +' '
+                if sent[j].lemma_ == 'tax':
+                    for j in range(len(sent)):
+                        tax += sent[j].text +' '
+                if sent[j].lemma_ in ['immigration','immigrant','refugee','immigrate']:
+                    for j in range(len(sent)):
+                        imm += sent[j].text +' '
+                if sent[j].lemma_ in ['healthcare','medicare','medicaid','obamacare']:
+                    for j in range(len(sent)):
+                        hea += sent[j].text +' '
+                elif sent[j].lemma_ == 'health' and str(sent[j].nbor()) == 'care':
+                    for j in range(len(sent)):
+                        hea += sent[j].text +' '
+
+        rep_glo.append(glo_r.similarity(nlp(glo)))
+        rep_gun.append(gun_r.similarity(nlp(gun)))
+        rep_hea.append(hea_r.similarity(nlp(hea)))
+        rep_imm.append(imm_r.similarity(nlp(imm)))
+        rep_tax.append(tax_r.similarity(nlp(tax)))
+
+        dem_glo.append(glo_d.similarity(nlp(glo)))
+        dem_gun.append(gun_d.similarity(nlp(gun)))
+        dem_hea.append(hea_d.similarity(nlp(hea)))
+        dem_imm.append(imm_d.similarity(nlp(imm)))
+        dem_tax.append(tax_d.similarity(nlp(tax)))
+
+        text_list.append(text)
+        vec_list.append(doc.vector)
+        lem_list.append(lem)
+        pos_list.append(pos)
+
+
+    features = [labels, years, pos_list, text_list, lem_list, vec_list,
+                rep_glo, rep_gun, rep_hea, rep_imm, rep_tax, dem_glo, dem_gun, dem_hea, dem_imm, dem_tax]
+
+    return features
+
+def extract_training_features(raw_features, bow=True, bol=False, vec=True, pos=False, top=False):
+    """
+    Extract features from list of labelled text data
+    :param data: list of labelled text data -> read_corpus
+    :return: pandas dataframe feature matrix X, and labels list y
+    """
+    x_list = []
+    if bow==True:
+        x_bow = pd.DataFrame((bow_vectorizer.fit_transform(raw_features[3])).toarray())
+        x_list.append(x_bow)
+    if vec==True:
+        x_vec = pd.DataFrame(raw_features[5])
+        x_list.append(x_vec)
+    if bol==True:
+        x_lem = pd.DataFrame((lem_vectorizer.fit_transform(raw_features[4])).toarray())
+        x_list.append(x_lem)
+    if pos==True:
+        x_pos = pd.DataFrame((pos_vectorizer.fit_transform(raw_features[2])).toarray())
+        x_list.append(x_pos)
+    if top==True:
+        x_list.append(pd.DataFrame(raw_features[6]))
+        x_list.append(pd.DataFrame(raw_features[7]))
+        x_list.append(pd.DataFrame(raw_features[8]))
+        x_list.append(pd.DataFrame(raw_features[9]))
+        x_list.append(pd.DataFrame(raw_features[10]))
+        x_list.append(pd.DataFrame(raw_features[11]))
+        x_list.append(pd.DataFrame(raw_features[12]))
+        x_list.append(pd.DataFrame(raw_features[13]))
+        x_list.append(pd.DataFrame(raw_features[14]))
+        x_list.append(pd.DataFrame(raw_features[15]))
+
+    X = pd.concat([x for x in x_list], axis=1)
+    X = np.nan_to_num(X)
+    y_p = np.array(raw_features[0])
+    y_y = np.array(raw_features[1])
+    return X, y_p, y_y
+
+def extract_test_features(raw_features, bow=True, bol=False, vec=True, pos=False, top=False):
+    """
+    Extract features from list of labelled text data
+    :param data: list of labelled text data -> read_corpus
+    :return: pandas dataframe feature matrix X, and labels list y
+    """
+
+    x_list = []
+    if bow==True:
+        x_bow = pd.DataFrame((bow_vectorizer.transform(raw_features[3])).toarray())
+        x_list.append(x_bow)
+    if vec==True:
+        x_vec = pd.DataFrame(raw_features[5])
+        x_list.append(x_vec)
+    if bol==True:
+        x_lem = pd.DataFrame((lem_vectorizer.transform(raw_features[4])).toarray())
+        x_list.append(x_lem)
+    if pos==True:
+        x_pos = pd.DataFrame((pos_vectorizer.transform(raw_features[2])).toarray())
+        x_list.append(x_pos)
+    if top==True:
+        x_list.append(pd.DataFrame(raw_features[6]))
+        x_list.append(pd.DataFrame(raw_features[7]))
+        x_list.append(pd.DataFrame(raw_features[8]))
+        x_list.append(pd.DataFrame(raw_features[9]))
+        x_list.append(pd.DataFrame(raw_features[10]))
+        x_list.append(pd.DataFrame(raw_features[11]))
+        x_list.append(pd.DataFrame(raw_features[12]))
+        x_list.append(pd.DataFrame(raw_features[13]))
+        x_list.append(pd.DataFrame(raw_features[14]))
+        x_list.append(pd.DataFrame(raw_features[15]))
+
+    X = pd.concat([x for x in x_list], axis=1)
+    X = np.nan_to_num(X)
+    y_p = np.array(raw_features[0])
+    y_y = np.array(raw_features[1])
+
+    return X, y_p, y_y
+
+
+def classification_cv(clf, X, y, cv_folds=10, scoring='f1_macro'):
+    scores = cross_val_score(clf, X, y, cv=cv_folds, scoring=scoring)
+    print(cv_folds,'-fold cross validation')
+    print(scores)
+    print(np.mean(scores), np.std(scores))
+    print('\n')
+
+def plot_confusion_matrix(cm, classes,
+                          normalize=False,
+                          title='Confusion matrix',
+                          cmap=plt.cm.Blues):
+    """
+    This function prints and plots the confusion matrix.
+    Normalization can be applied by setting `normalize=True`.
+    """
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        print("Normalized confusion matrix")
+    else:
+        print('Confusion matrix, without normalization')
+
+    print(cm)
+
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45)
+    plt.yticks(tick_marks, classes)
+
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        plt.text(j, i, format(cm[i, j], fmt),
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+
+def test_bias(test_corpus_path, pipe):
+    print('Testing political affiliation on ', test_corpus_path)
+    data_test = read_corpus(test_corpus_path)
+    X_test, y_p_test, y_y_test = extract_test_features(process(data_test))
+    cnf_matrix = confusion_matrix(y_p_test, pipe.predict(X_test))
+    print('F1 Score = ', f1_score(y_p_test, pipe.predict(X_test)))
+    print(cnf_matrix)
+
+    np.set_printoptions(precision=2)
+    plt.figure()
+    plot_confusion_matrix(cnf_matrix, classes=np.array([1,0]), normalize=True,
+                          title='Normalized confusion matrix')
+    plt.show()
+
+def report(results, n_top=3):
+    for i in range(1, n_top + 1):
+        candidates = np.flatnonzero(results['rank_test_score'] == i)
+        for candidate in candidates:
+            print("Model with rank: {0}".format(i))
+            print("Mean validation score: {0:.3f} (std: {1:.3f})".format(
+                  results['mean_test_score'][candidate],
+                  results['std_test_score'][candidate]))
+            print("Parameters: {0}".format(results['params'][candidate]))
+            print("")
+
+def evaluate(clf, X_train, y_train, X_test, y_test, show_cm=False):
+    start = time.time()
+    clf = clf
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+
+    try:
+        print('F1 Score:\n', f1_score(y_test, y_pred), '\n')
+    except:
+        try:
+            print('F1 Score micro\n', f1_score(y_test, y_pred, average='micro'))
+        except:
+            print('F score not possible')
+    try:
+        print('AUC Score:\n', roc_auc_score(y_test, y_pred))
+    except:
+        try:
+            print('AUC Score:\n', roc_auc_score(y_test, y_pred, average='micro'))
+        except:
+            print('AUC score not possible')
+
+    end = time.time()
+    print('Time in seconds: ', end-start)
+    if show_cm:
+        unique_label = np.unique(y_test)
+        cm = confusion_matrix(y_test, y_pred)
+        print('Confusion Matrix:\n', cm, '\n')
+        print(pd.DataFrame(confusion_matrix(y_test, y_pred, labels=unique_label),
+                       index=['true:{:}'.format(x) for x in unique_label],
+                       columns=['pred:{:}'.format(x) for x in unique_label]))
+
+
+
+
+
+bow_vectorizer = TfidfVectorizer(lowercase=True, stop_words='english', ngram_range=(1,3), max_features=3000)
+lem_vectorizer = TfidfVectorizer(lowercase=True, stop_words='english', ngram_range=(1,3), max_features=3000)
+pos_vectorizer = CountVectorizer(lowercase=False, ngram_range=(4,4), max_df=0.8, min_df=0.05, max_features=2000)
+
+def main():
+
+    print('Start time:', time.asctime(time.localtime(time.time())))
+
+    print('Reading data...')
+    # Select data to read and use for training and testing
+    '''
+    data_s = read_corpus('Corpus of PS since New Deal')
+    data_l = read_csv('SEL_perparty_v2.csv')
+    data = data_s + data_l
+    '''
+    data_nn = read_corpus('News Corpus')
+    data_nw = read_corpus('News wayback')
+    data = data_nn+data_nw
+
+    shuffle(data)
+    # load data
+    data_c = read_corpus('Clinton-Romney Corpus')
+
+    bow = json.load(open('bow_o.txt', 'rb'))
+    bow = bow_vectorizer.fit_transform(bow)
+    x_bow = pd.DataFrame(bow.toarray())
+
+    '''
+    x_vec = pd.DataFrame(np.load('vec_o.npy'))
+    
+    lem = json.load(open('lem_o.txt', 'rb'))
+    lem = lem_vectorizer.fit_transform(lem)
+    x_lem = pd.DataFrame(lem.toarray())
+    
+    pos = json.load(open('pos_o.txt', 'rb'))
+    pos = pos_vectorizer.fit_transform(pos)
+    x_pos = pd.DataFrame(pos.toarray())
+         
+    x_d_glo = pd.DataFrame(np.load('d_glo_o.npy'))
+    x_d_gun = pd.DataFrame(np.load('d_gun_o.npy'))
+    x_d_hea = pd.DataFrame(np.load('d_hea_o.npy'))
+    x_d_imm = pd.DataFrame(np.load('d_imm_o.npy'))
+    x_d_tax = pd.DataFrame(np.load('d_tax_o.npy'))
+    x_r_glo = pd.DataFrame(np.load('r_glo_o.npy'))
+    x_r_gun = pd.DataFrame(np.load('r_gun_o.npy'))
+    x_r_hea = pd.DataFrame(np.load('r_hea_o.npy'))
+    x_r_imm = pd.DataFrame(np.load('r_imm_o.npy'))
+    x_r_tax = pd.DataFrame(np.load('r_tax_o.npy'))
+    
+    '''
+
+    print('Processing data...', time.asctime( time.localtime(time.time())))
+
+    #X = np.load('X_base.npy')
+    y_p, y_y = np.load('y_p_o.npy'), np.load('y_y_o.npy')
+    #X_t, y_p_t, y_y_t = np.load('X_t_base.npy'), np.load('y_p_t_base.npy'), np.load('y_y_t_base.npy')
+    #X = pd.concat([x_bow, x_vec,x_lem, x_d_glo, x_d_gun, x_d_hea, x_d_imm, x_d_tax, x_r_glo, x_r_gun, x_r_hea, x_r_imm, x_r_tax], axis=1)
+    #X = pd.concat([x_bow, x_vec, x_d_glo, x_d_gun, x_d_hea, x_d_imm, x_d_tax, x_r_glo, x_r_gun, x_r_hea, x_r_imm, x_r_tax], axis=1)
+    X = x_bow
+    y_p = pd.DataFrame(y_p)
+    y_y = pd.DataFrame(y_y)
+
+    # Extract test features
+    test_feats = process(data)
+    X_cr, y_p_cr, y_y_cr = extract_test_features(test_feats, vec=False)
+
+
+    # append to prepare for stratified kfold
+    print('Features extracted. Selecting features...')
+    # Select training features
+
+    smote = SMOTEENN()
+    X_p_r, y_p_r = smote.fit_sample(X, y_p)
+    # for year estimation
+    X_y_r, y_y_r = smote.fit_sample(X, y_y)
+
+    cv = StratifiedKFold(n_splits=5)
+    for train, test in cv.split(X_p_r, y_p_r):
+        X_p, y_p = X_p_r[train], y_p_r[train]
+        X_p_t, y_p_t = X_p_r[test], y_p_r[test]
+
+    for train, test in cv.split(X_y_r, y_y_r):
+        X_y, y_y = X_y_r[train], y_y_r[train]
+        X_y_t, y_y_t = X_y_r[test], y_y_r[test]
+
+    print('----------------------------------------------------------')
+    print('Testing...', time.asctime(time.localtime(time.time())))
+
+    params = {}
+    
+    clf_p = SGDClassifier()
+    print('SGDClassifier')
+    print('Held out set')
+    print('\nCV bias')
+    evaluate(clf_p, X_p, y_p, X_p_t, y_p_t)
+
+    print('News Set')
+    print('\nCV bias')
+    evaluate(clf_p, X_p, y_p, X_cr, y_p_cr, show_cm=True)
+    print('----------------------------------------------------------')
+
+
+    clf_y = GaussianNB()
+    print('GaussianNB')
+    print('Held out set')
+    print('\nCV era')
+    evaluate(clf_y, X_y, y_y, X_y_t, y_y_t)
+
+    print('News Set')
+    print('\nCV era')
+    evaluate(clf_y, X_y, y_y, X_cr, y_y_cr, show_cm=True)
+    print('----------------------------------------------------------')
+
+
+    print('Done', time.asctime( time.localtime(time.time())))
+    print('----------------------------------------------------------')
+if __name__ == "__main__":
+    main()
